@@ -7,6 +7,7 @@ Require Crypto.Util.Tuple.
 Require Import Util.OptionList.
 Require Import Crypto.Util.ErrorT.
 Require Import Crypto.Util.ZUtil.Tactics.PullPush.Modulo.
+Require Import Crypto.Util.ZUtil.Tactics.LtbToLt.
 Require Import Crypto.Util.ZUtil.Testbit.
 Require Import Crypto.Util.ZUtil.Hints.ZArith.
 Require Import Crypto.Util.ZUtil.Land.
@@ -34,7 +35,9 @@ Require Import Crypto.Util.Prod.
 Require Import Crypto.Util.Tactics.SplitInContext.
 Require Import Crypto.Util.Tactics.SpecializeBy.
 Require Import Crypto.Util.Tactics.SpecializeUnderBindersBy.
+Require Import Crypto.Util.Tactics.UniquePose.
 Require Import Crypto.Util.ZUtil.Lxor.
+Require Import Crypto.Util.ZUtil.Tactics.PeelLe.
 Require Import Crypto.Util.ZUtil.Tactics.RewriteModSmall.
 Require Import Crypto.Util.Tactics.WarnIfGoalsRemain.
 Require Import Crypto.Util.Bool.Reflect.
@@ -124,7 +127,7 @@ Definition show_op_subscript : Show op := fun o =>
 
 Definition associative o := match o with add _|mul _|mulZ|or _|and _|xor _|andZ|orZ|xorZ=> true | _ => false end.
 Definition commutative o := match o with add _|addcarry _|addoverflow _|mul _|mulZ|or _|and _|xor _|andZ|orZ|xorZ => true | _ => false end.
-Definition identity o := match o with mul N0 => Some 0%Z| mul _|mulZ=>Some 1%Z |add _|addZ|or _|orZ|xor _|xorZ|addcarry _|addcarryZ _|addoverflow _ => Some 0%Z | and s => Some (Z.ones (Z.of_N s))|andZ => Some (-1)%Z |_=> None end.
+Definition identity o := match o with mul s => Some match s with N0 => 0%Z | _ => 1%Z end| mulZ=>Some 1%Z |add _|addZ|or _|orZ|xor _|xorZ|addcarry _|addcarryZ _|addoverflow _ => Some 0%Z | and s => Some (Z.ones (Z.of_N s))|andZ => Some (-1)%Z |_=> None end.
 (* identity, but not in the first slot *)
 Definition identity_after_0 o := match o with subborrow _|subborrowZ _ => Some 0%Z | _=> None end.
 Definition unary_truncate_size o := match o with add s|and s|or s|xor s|mul s => Some (Z.of_N s) | addZ|mulZ|andZ|orZ|xorZ => Some (-1)%Z | _ => None end.
@@ -791,6 +794,357 @@ Proof using Type.
 Qed.
 
 Local Open Scope Z_scope.
+Require Crypto.Language.API.
+Require Crypto.AbstractInterpretation.ZRange.
+Require Crypto.AbstractInterpretation.ZRangeProofs.
+
+Section bound_expr_via_PHOAS.
+  Import Crypto.Util.ZRange.
+  Import API.Compilers.
+  Import AbstractInterpretation.ZRange.Compilers.
+  Import AbstractInterpretation.ZRangeProofs.Compilers.
+
+  Local Instance : shiftr_avoid_uint1_opt := false.
+  Local Notation interp_PHOAS_op := (ZRange.ident.option.interp true).
+
+  Definition op_to_PHOAS_binop (o : op) : option _
+    := match o with
+       | add _ => Some ident.Z_add
+       | shl _ => Some ident.Z_shiftl
+       | shr _ => Some ident.Z_shiftr
+       | and _ => Some ident.Z_land
+       | or _ => Some ident.Z_lor
+       | xor _ => Some ident.Z_lxor
+       | mul _ => Some ident.Z_mul
+       | addZ => Some ident.Z_add
+       | mulZ => Some ident.Z_mul
+       | shlZ => Some ident.Z_shiftl
+       | shrZ => Some ident.Z_shiftr
+       | andZ => Some ident.Z_land
+       | orZ => Some ident.Z_lor
+       | xorZ => Some ident.Z_lxor
+       | _ => None
+       end.
+  Definition op_to_PHOAS_unop (o : op) : option _
+    := match o with
+       | neg _ => Some ident.Z_opp
+       | negZ => Some ident.Z_opp
+       | _ => None
+       end.
+  Definition op_to_PHOAS_tritop (o : op) : option _
+    := match o with
+       | selectznz => Some ident.Z_zselect
+       | _ => None
+       end.
+  Definition op_to_bounds (o : op) : option _
+    := match o with
+       | add s
+       | shl s
+       | shr s
+       | and s
+       | or s
+       | xor s
+       | mul s
+       | neg s
+         => Some r[0~>Z.ones (Z.of_N s)]
+       | _ => None
+       end%zrange.
+
+  Definition op_to_PHOAS_bounds (o : op) : option (list (option zrange) -> option zrange)
+    := match o with
+       | old s _ => Some (fun _ => Some r[0~>Z.ones (Z.of_N s)])
+       | const x
+         => Some (fun _ => interp_PHOAS_op (ident.Literal (t:=base.type.Z) x))
+       | (add _|and _|or _|xor _|mul _) as o
+         => let b : zrange := Option.invert_Some (op_to_bounds o) in
+            let id : Z := Option.invert_Some (identity o) in
+            let o := interp_PHOAS_op (Option.invert_Some (op_to_PHOAS_binop o)) in
+            Some (fun args => interp_PHOAS_op ident.Z_cast (Some b) (fold_right o (Some r[id~>id]) args))
+       | (addcarry _ | subborrow _ | addoverflow _ | iszero)
+         => Some (fun _ => Some r[0~>1])
+       | (addZ|mulZ|andZ|orZ|xorZ) as o
+         => let id : Z := Option.invert_Some (identity o) in
+            let o := interp_PHOAS_op (Option.invert_Some (op_to_PHOAS_binop o)) in
+            Some (fold_right o (Some r[id~>id]))
+       | (shl _|shr _) as o
+         => let b : zrange := Option.invert_Some (op_to_bounds o) in
+            let o := interp_PHOAS_op (Option.invert_Some (op_to_PHOAS_binop o)) in
+            Some (fun args
+                  => match args with
+                     | [x; y] => interp_PHOAS_op ident.Z_cast (Some b) (o x y)
+                     | _ => None
+                     end)
+       | (shlZ|shrZ) as o
+         => let o := interp_PHOAS_op (Option.invert_Some (op_to_PHOAS_binop o)) in
+            Some (fun args
+                  => match args with
+                     | [x; y] => o x y
+                     | _ => None
+                     end)
+       | (neg _) as o
+         => let b : zrange := Option.invert_Some (op_to_bounds o) in
+            let o := interp_PHOAS_op (Option.invert_Some (op_to_PHOAS_unop o)) in
+            Some (fun args
+                  => match args with
+                     | [x] => interp_PHOAS_op ident.Z_cast (Some b) (o x)
+                     | _ => None
+                     end)
+       | (negZ) as o
+         => let o := interp_PHOAS_op (Option.invert_Some (op_to_PHOAS_unop o)) in
+            Some (fun args
+                  => match args with
+                     | [x] => o x
+                     | _ => None
+                     end)
+       | (selectznz) as o
+         => let o := interp_PHOAS_op (Option.invert_Some (op_to_PHOAS_tritop o)) in
+            Some (fun args
+                  => match args with
+                     | [x; y; z] => o x y z
+                     | _ => None
+                     end)
+       | (slice _ s | sar s | rcr s) as o
+         => Some (fun _ => Some r[0~>Z.ones (Z.of_N s)])
+       | set_slice 0 w
+         => Some (fun args
+                  => match args with
+                     | [Some a; Some b]
+                       => if ((lower a <? 0) || (lower b <? 0))%Z%bool
+                          then None
+                          else let a := upper a in
+                               let b := upper b in
+                               Some r[0~>(Z.lor
+                                            (Z.land (Z.ones (Z.succ (Z.log2 b))) (Z.ones (Z.of_N w)))
+                                            (Z.ldiff (Z.ones (Z.succ (Z.log2 a))) (Z.ones (Z.of_N w))))]
+                     | _ => None
+                     end)
+       | addcarryZ _
+       | subborrowZ _
+       | set_slice _ _
+         => None
+       end%zrange.
+
+  Fixpoint bound_expr_via_PHOAS (e : Symbolic.expr) : option zrange
+    := match e with
+       | ExprApp (o, args)
+         => match op_to_PHOAS_bounds o with
+            | Some o
+              => o (List.map bound_expr_via_PHOAS args)
+            | None => None
+            end
+       | ExprRef _ => None
+       end.
+
+  Local Coercion is_true : bool >-> Sortclass.
+
+  Lemma interp_op_op_to_PHOAS_bounds G o bf arg_bounds args v b
+        (H : op_to_PHOAS_bounds o = Some bf)
+        (Hargs : Forall2 (fun v b => match b with
+                                     | Some b => is_bounded_by_bool v b = true
+                                     | None => True
+                                     end)
+                         args arg_bounds)
+        (Hop : interp_op G o args = Some v)
+        (Hb : bf arg_bounds = Some b)
+    : is_bounded_by_bool v b.
+  Proof.
+    cbv [op_to_PHOAS_bounds] in *.
+    all: repeat first [ progress subst
+                      | progress inversion_option
+                      | progress cbn [interp_op] in *
+                      | break_innermost_match_hyps_step ].
+    all: let rec do_on T :=
+           lazymatch T with
+           | ?F ?x
+             => let h := head x in
+                try (constr_eq h (@ZRange.ident.option.interp); destruct x eqn:?);
+                do_on F
+           | _ => idtac
+           end in
+         repeat match goal with
+                | [ H : ?T = Some _ |- _ ] => do_on T
+                end.
+    all: repeat match goal with
+                | [ H : context[@ZRange.ident.option.interp ?a ?b ?t ?op] |- _ ]
+                  => unique pose proof (@ZRange.ident.option.interp_related a b t op)
+                end.
+    all: cbn -[interp_PHOAS_op] in *.
+    all: cbv [Morphisms.respectful_hetero] in *.
+    all: invlist Forall2.
+    all: repeat first [ progress subst
+                      | assumption
+                      | match goal with
+                        | [ H : Forall2 _ nil _ |- _ ] => inversion H; clear H
+                        | [ H : Forall2 _ (_ :: _) _ |- _ ] => inversion H; clear H
+                        | [ H : ?x = Some _, H' : context[?x] |- _ ] => rewrite H in H'
+                        end ].
+    6: {
+    all: cbn -[interp_PHOAS_op] in *.
+
+    all: cbv [type.related_hetero Morphisms.respectful_hetero type.interp ZRange.type.base.option.is_bounded_by ZRange.type.base.is_bounded_by ZRange.type.base.option.interp ZRange.type.base.interp API.interp_type] in *.
+    all: cbn [API.Compilers.ident.interp] in *; cbv [ident.literal] in *.
+    all: break_innermost_match_hyps; inversion_option; subst.
+    all: try assumption.
+    all: cbv [is_bounded_by_bool is_true]; cbn [upper lower]; rewrite Bool.andb_true_iff, ?Z.leb_le_iff, ?Z.land_ones, ?Z.ones_equiv by lia; try (split; try lia; auto with zarith; []).
+    all: cbn -[interp_PHOAS_op] in *.
+    all: lazymatch goal with
+         | [ H : interp_PHOAS_op ident.Z_cast ?a ?b = Some _, H' : context[interp_PHOAS_op ident.Z_cast] |- _ ]
+           => lazymatch type of H' with forall (x : option zrange) (y : zrange), _ => idtac end;
+              specialize (fun y' H1 => H' a y' H1 b);
+              rewrite H in H'
+         | _ => idtac
+         end.
+    all: specialize_under_binders_by apply zrange_lb.
+    all: specialize_under_binders_by reflexivity.
+    all: cbv [Z.b2z]; break_innermost_match; try lia.
+    all: break_innermost_match_hyps.
+    all: invlist Forall2.
+    all: cbv [PreExtra.ident.cast] in *.
+    all: try (Z.to_euclidean_division_equations; lia).
+    3: {
+          cbv [is_bounded_by_bool]; cbn [l
+    all: cbn -[interp_PHOAS_op] in *.
+    2: {
+         erewrite Hb in H.
+
+
+           end;
+           progress specialize_under_binders_by erewrite H
+      end.
+    2: {
+              cbv [type.related_hetero Morphisms.respectful_hetero type.interp] in *; try rewrite H in H'
+         | _ => idtac
+         end.
+    all: cbv [ZRange.type.base.option.is_bounded_by ZRange.type.base.is_bounded_by] in *;
+    all: try assumption.
+    2: {
+         Search ZRange.ident.option.interp.
+    Search (_ mod _ <= _).
+    etransitivity; [ apply Z.mod_le | ]; try lia.
+    Search Z.ones.
+                      | ].
+
+        option (list (option zrange) -> option zrange)
+  Fixpoint interp_op_bound_expr_via_PHOAS G e b {struct e}
+    : bound_expr_via_PHOAS e = Some b ->
+      forall v, interp_op o eval G d e v -> is_bounded_by_bool v b = true.
+  Proof using Type.
+    intros H d.
+    specialize (fun e b H => eval_bound_expr_via_PHOAS G e b H d).
+    destruct e as [?|[n args] ]; cbn [bound_expr_via_PHOAS] in *.
+    { clear eval_bound_expr_via_PHOAS; intros; inversion_option. }
+
+  Fixpoint eval_bound_expr_via_PHOAS G e b {struct e}
+    : bound_expr_via_PHOAS e = Some b ->
+      forall d v, eval G d e v -> is_bounded_by_bool v b = true.
+  Proof using Type.
+    intros H d.
+    specialize (fun e b H => eval_bound_expr_via_PHOAS G e b H d).
+    destruct e as [?|[n args] ]; cbn [bound_expr_via_PHOAS] in *.
+    { clear eval_bound_expr_via_PHOAS; intros; inversion_option. }
+    assert (Forall
+    Search map.
+    assert (Forall2
+    revert b; induction e; cbn [bound_expr_via_PHOAS].
+  revert b; induction e; simpl bound_expr; BreakMatch.break_match;
+    inversion 2; intros; inversion_option; subst;
+    try match goal with H : context [set_slice] |- _ => shelve end;
+    cbv [interp_op] in *;
+    BreakMatch.break_match_hyps; inversion_option; subst;
+    rewrite ?Z.ldiff_ones_r, ?Z.land_ones, ?Z.ones_equiv;
+    cbv [Z.b2z];
+    try match goal with |- context [(?a mod ?b)%Z] => unshelve epose proof Z.mod_pos_bound a b ltac:(eapply Z.pow_pos_nonneg; Lia.lia) end;
+    repeat t;
+    try (Z.div_mod_to_equations; Lia.lia).
+  all: repeat match goal with
+              | [ H' : Forall _ _, H'' : Option.List.lift (List.map bound_expr _) = Some _, H''' : Forall2 (eval _ _) _ _ |- _ ]
+                => unique pose proof (bound_sum' _ _ _ H' _ H'' _ H''');
+                   unique pose proof (bound_prod' _ _ _ H' _ H'' _ H''')
+              end.
+  all: try lia.
+  all: try (split; [ lia | ]).
+  all: try (eapply Z.min_glb_iff; split; try lia; []).
+  all: try solve [ etransitivity; [ eapply Zmod_le | ]; lia ].
+  all: rewrite ?Z.shiftl_mul_pow2, ?Z.shiftr_div_pow2, ?Z.ones_equiv in * by lia.
+  all: repeat match goal with
+              | [ H : context[?x <= ?y] |- context[?b^?x] ]
+                => (unique assert (b^x <= b^y) by now Z.peel_le; lia);
+                   try assert (0 < b^x) by auto with zarith;
+                   try assert (0 < b^y) by auto with zarith
+              end.
+  all: rewrite ?Z.mod_small by nia.
+  all: try nia.
+  rewrite Z.mod_small.
+  match goal with
+  | [ |- ?x / ?y <= ?z / ?w ]
+    => transitivity (z / y); Z.peel_le; try lia
+  end.
+  2: {
+  auto.
+  etransitivity; Z.peel_le.
+  Search (_ / _ <= _ / _).
+  eapply Z.div_le_compat_l.
+  destruct_head'_and.
+  clear dependent s.
+  apply Z.div
+  Z.peel_le.
+  all: Z.to_euclidean_division_equations.
+  specialize_by lia.
+  subst.
+  move q at bottom.
+  move
+  all: try split; try nia.
+  nia.
+  split; try nia.
+  Search Z.ones Z.pow.
+  Z.peel_le.
+  all: rewrite ?Z.mod_small by nia.
+  nia.
+  all: Z.peel_le.
+  Search (_^_ <= _^_).
+
+  all: rewrite ?Z.shiftr_div_pow2 in * by lia.
+  Z.peel_le.
+  etransitivity; [ eapply Zmod_le | ]; try lia.
+  Search Z.shiftl.
+  Z.peel_le.
+  { etransitivity; [ eapply Zmod_le | ]; lia.
+    all : try lia. }
+  all: try solve [
+                   lia
+                 | epose proof bound_prod' _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption);
+                   lia ].
+  3: {
+
+  Search Z.shiftl.
+  Unshelve. {
+    repeat t.
+    pose proof Z.log2_nonneg z; pose proof Z.log2_nonneg z0.
+    rewrite !Z.shiftl_0_r.
+    split.
+    { eapply Z.lor_nonneg; split; try eapply Z.land_nonneg; try eapply Z.ldiff_nonneg; Lia.lia. }
+    eapply Z.le_bitwise.
+    { eapply Z.lor_nonneg; split; try eapply Z.land_nonneg; try eapply Z.ldiff_nonneg; Lia.lia. }
+    { eapply Z.lor_nonneg; split; try eapply Z.land_nonneg; try eapply Z.ldiff_nonneg;
+        left; try eapply Z.ones_nonneg; Lia.lia. }
+    { intros i Hi.
+      Z.rewrite_bitwise.
+      destr (i <? Z.of_N sz);
+        rewrite ?Bool.andb_false_r, ?Bool.andb_true_r, ?Bool.orb_false_l, ?Bool.orb_false_r.
+      { clear -H Hi.
+        destr (i <? Z.succ (Z.log2 z0)).
+        { eapply Bool.le_implb, Bool.implb_true_r. }
+        rewrite Z.bits_above_log2; cbn; trivial; try Lia.lia.
+        destruct H as [H' H]; eapply Z.log2_le_mono in H. Lia.lia. }
+      { clear -H0 Hi.
+        destr (i <? Z.succ (Z.log2 z)).
+        { eapply Bool.le_implb, Bool.implb_true_r. }
+        rewrite Z.bits_above_log2; cbn; trivial; try Lia.lia.
+        destruct H0 as [? H0]; eapply Z.log2_le_mono in H0. Lia.lia. } } }
+Qed.
+
+
+Print ZRange
 
 Fixpoint bound_expr e : option Z := (* e <= r *)
   match e with
@@ -800,9 +1154,19 @@ Fixpoint bound_expr e : option Z := (* e <= r *)
             | Some bounds => Z.min (List.fold_right Z.add 0%Z bounds) (Z.ones (Z.of_N s))
             | None => Z.ones (Z.of_N s)
             end
+  | ExprApp (mul s, args) =>
+      Some  match Option.List.lift (List.map bound_expr args) with
+            | Some bounds => Z.min (List.fold_right Z.mul 1%Z bounds) (Z.ones (Z.of_N s))
+            | None => Z.ones (Z.of_N s)
+            end
   | ExprApp (addZ, args) =>
       match Option.List.lift (List.map bound_expr args) with
       | Some bounds => Some (List.fold_right Z.add 0%Z bounds)
+      | None => None
+      end
+  | ExprApp (mulZ, args) =>
+      match Option.List.lift (List.map bound_expr args) with
+      | Some bounds => Some (List.fold_right Z.mul 1%Z bounds)
       | None => None
       end
   | ExprApp (selectznz, [c;a;b]) =>
@@ -817,7 +1181,27 @@ Fixpoint bound_expr e : option Z := (* e <= r *)
                                   (Z.ldiff (Z.ones (Z.succ (Z.log2 a))) (Z.ones (Z.of_N w))))
       | _, _ => None
       end
-  | ExprApp ((old s _ | slice _ s | mul s | shl s | shr s | sar s | neg s | and s | or s | xor s), _) => Some (Z.ones (Z.of_N s))
+  | ExprApp (shr s, [a;b]) =>
+      match bound_expr a, bound_expr b with
+      | Some a, Some b
+        => Some (let ab := Z.shiftr a b in
+                 let ones_s := Z.ones (Z.of_N s) in
+                 if (ab <=? ones_s)%Z
+                 then ab
+                 else ones_s)
+      | _, _ => Some (Z.ones (Z.of_N s))
+      end
+  | ExprApp (shl s, [a;b]) =>
+      match bound_expr a, bound_expr b with
+      | Some a, Some b
+        => Some (let ab := Z.shiftl a b in
+                 let ones_s := Z.ones (Z.of_N s) in
+                 if (ab <=? ones_s)%Z
+                 then ab
+                 else ones_s)
+      | _, _ => Some (Z.ones (Z.of_N s))
+      end
+  | ExprApp ((old s _ | slice _ s | sar s | neg s | and s | or s | xor s), _) => Some (Z.ones (Z.of_N s))
   | ExprApp ((addcarry _ | subborrow _ | addoverflow _ | iszero), _) => Some 1
   | _ => None
   end%Z.
@@ -861,6 +1245,23 @@ Proof using Type.
   Lia.lia.
 Qed.
 
+Lemma bound_prod' G d
+  es (He : Forall (fun e => forall b, bound_expr e = Some b ->
+       forall (d : dag) (v : Z), eval G d e v -> (0 <= v <= b)%Z) es)
+  : forall
+  bs (Hb : Option.List.lift (map bound_expr es) = Some bs)
+  vs (Hv : Forall2 (eval G d) es vs)
+  , (0 <= fold_right Z.mul 1 vs <= fold_right Z.mul 1 bs)%Z.
+Proof using Type.
+  induction He; cbn in *; repeat t.
+  { cbv [fold_right]; Lia.lia. }
+  destruct (bound_expr _) eqn:? in *; cbn in *; repeat t.
+  destruct (fold_right (B:=option _) _) eqn:? in *; cbn in *; repeat t.
+  specialize (IHHe _ ltac:(eassumption) _ ltac:(eassumption)); cbn.
+  specialize (H _ ltac:(exact eq_refl) _ _ ltac:(eassumption)).
+  nia.
+Qed.
+
 Require Import Util.ZRange.LandLorBounds.
 Lemma eval_bound_expr G e b : bound_expr e = Some b ->
   forall d v, eval G d e v -> (0 <= v <= b)%Z.
@@ -875,14 +1276,67 @@ Proof using Type.
     try match goal with |- context [(?a mod ?b)%Z] => unshelve epose proof Z.mod_pos_bound a b ltac:(eapply Z.pow_pos_nonneg; Lia.lia) end;
     repeat t;
     try (Z.div_mod_to_equations; Lia.lia).
-  { clear dependent args'0.
-    epose proof bound_sum' _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption).
-    split; try Lia.lia.
-    eapply Z.min_glb_iff; split; try Lia.lia.
-    etransitivity. eapply Zmod_le.
-    all : try Lia.lia. }
-  { epose proof bound_sum' _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption).
-    lia. }
+  all: repeat match goal with
+              | [ H' : Forall _ _, H'' : Option.List.lift (List.map bound_expr _) = Some _, H''' : Forall2 (eval _ _) _ _ |- _ ]
+                => unique pose proof (bound_sum' _ _ _ H' _ H'' _ H''');
+                   unique pose proof (bound_prod' _ _ _ H' _ H'' _ H''')
+              end.
+  all: try lia.
+  all: try (split; [ lia | ]).
+  all: try (eapply Z.min_glb_iff; split; try lia; []).
+  all: try solve [ etransitivity; [ eapply Zmod_le | ]; lia ].
+  all: rewrite ?Z.shiftl_mul_pow2, ?Z.shiftr_div_pow2, ?Z.ones_equiv in * by lia.
+  all: repeat match goal with
+              | [ H : context[?x <= ?y] |- context[?b^?x] ]
+                => (unique assert (b^x <= b^y) by now Z.peel_le; lia);
+                   try assert (0 < b^x) by auto with zarith;
+                   try assert (0 < b^y) by auto with zarith
+              end.
+  all: rewrite ?Z.mod_small by nia.
+  all: try nia.
+  rewrite Z.mod_small.
+  match goal with
+  | [ |- ?x / ?y <= ?z / ?w ]
+    => transitivity (z / y); Z.peel_le; try lia
+  end.
+  2: {
+  auto.
+  etransitivity; Z.peel_le.
+  Search (_ / _ <= _ / _).
+  eapply Z.div_le_compat_l.
+  destruct_head'_and.
+  clear dependent s.
+  apply Z.div
+  Z.peel_le.
+  all: Z.to_euclidean_division_equations.
+  specialize_by lia.
+  subst.
+  move q at bottom.
+  move
+  all: try split; try nia.
+  nia.
+  split; try nia.
+  Search Z.ones Z.pow.
+  Z.peel_le.
+  all: rewrite ?Z.mod_small by nia.
+  nia.
+  all: Z.peel_le.
+  Search (_^_ <= _^_).
+
+  all: rewrite ?Z.shiftr_div_pow2 in * by lia.
+  Z.peel_le.
+  etransitivity; [ eapply Zmod_le | ]; try lia.
+  Search Z.shiftl.
+  Z.peel_le.
+  { etransitivity; [ eapply Zmod_le | ]; lia.
+    all : try lia. }
+  all: try solve [
+                   lia
+                 | epose proof bound_prod' _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption) _ ltac:(eassumption);
+                   lia ].
+  3: {
+
+  Search Z.shiftl.
   Unshelve. {
     repeat t.
     pose proof Z.log2_nonneg z; pose proof Z.log2_nonneg z0.
@@ -2256,6 +2710,39 @@ Definition expr : expr -> expr :=
   ;addbyte_small
   ;xor_same
   ].
+
+Compute option_map (fun v => 2^64-1-v) (bound_expr
+           (ExprApp
+              (addZ,
+              [ExprApp (shr 64%N, [ExprApp (mulZ, [ExprApp (old 64%N 3, []); ExprApp (old 64%N 5, [])]); ExprApp (const 64%Z, [])]);
+              ExprApp
+                (addcarry 64%N,
+                [ExprApp (mul 64%N, [ExprRef 3%N; ExprRef 5%N]);
+                ExprApp
+                  (add 64%N,
+                  [ExprApp (shr 64%N, [ExprRef 19%N; ExprApp (const 64%Z, [])]);
+                  ExprApp (addcarry 64%N, [ExprRef 20%N; ExprRef 26%N])])])]))).
+
+Goal True.
+  pose (expr (ExprApp (addcarry 64, [ExprRef 12; ExprApp (add 64, [ExprApp (shr 64, [ExprRef 15; ExprRef 10]); ExprApp (addcarry 64, [ExprApp (mul 64, [ExprRef 3; ExprRef 5]); ExprApp (add 64, [ExprApp (shr 64, [ExprRef 19; ExprRef 10]); ExprApp (addcarry 64, [ExprRef 20; ExprRef 26])])])])]))%N) as e.
+  cbv [expr] in e.
+  cbn [fold_left] in e.
+  Set Printing Depth 10000.
+  vm_compute constprop in e.
+  vm_compute slice0 in e.
+  vm_compute drop_identity in e.
+  set (e' := flatten_bounded_associative _) in (value of e).
+  clear e.
+  cbv [flatten_bounded_associative] in e'.
+  cbn [flat_map] in e'.
+  set (e'' := bounds_for_drop_inner_associative _ _) in (value of e').
+  vm_compute in e''.
+  subst e''.
+  cbv beta iota zeta in e'.
+  set (e'' := bound_expr _) in (value of e').
+  Compute 2^64-18446744073709551615.
+  vm_compute in e''.
+  cbv
 
 Lemma eval_expr c d e v : eval c d e v -> eval c d (expr e) v.
 Proof using Type.
